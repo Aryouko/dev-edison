@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+
+# médias lourds et exports (garder assets/samples léger, quelques Mo max)
+exports/
+*.mp4
+*.mov
+*.mkv
+*.wav
+!assets/samples/*.mp4
+!tests/data/*.mp4
