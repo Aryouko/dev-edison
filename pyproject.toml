@@ -1,0 +1,9 @@
+[project]
+name = "edison"
+version = "0.1.0"
+description = "Edison, logiciel de montage vidéo simple (IUT de Vannes, R5.A.05 / R5.A.06)"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
