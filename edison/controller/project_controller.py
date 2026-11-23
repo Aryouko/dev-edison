@@ -1,3 +1,4 @@
+
 """Project controller: open project, media library, selection, editing actions.
 
 Signals (Observer pattern of the CDC): the views connect to them and refresh.
@@ -41,17 +42,20 @@ class _ImportTask(QRunnable):
     The results go back to the main thread through the signals (queued connections).
     """
 
-    def __init__(self, batch: int, path: str):
+    def __init__(self, batch: int, path: str, audio_store: AudioStore | None = None):
         super().__init__()
         self.batch = batch
         self.path = path
         self.signals = _ImportSignals()
+        self.audio_store = audio_store
 
     def run(self) -> None:
         name = Path(self.path).name
         try:
             media = probe_media(self.path)
             thumbnail = video_thumbnail(media)
+            if media.has_audio:
+                self.audio_store.load(media)
             # TODO(S4): self.audio_store.load(media) when the media has sound.
         except UnsupportedMediaError as error:
             self.signals.failed.emit(self.batch, name, str(error))
@@ -62,6 +66,7 @@ class _ImportTask(QRunnable):
             self.signals.imported.emit(self.batch, media, thumbnail)
         finally:
             self.signals.finished.emit(self.batch, self)
+
 
 
 class _ImportBatch:
@@ -193,7 +198,7 @@ class ProjectController(QObject):
         self._import_batches[batch] = _ImportBatch(self.project, len(accepted), errors)
         self.message.emit(f"Import de {len(accepted)} fichier(s)...")
         for path in accepted:
-            task = _ImportTask(batch, path)
+            task = _ImportTask(batch, path, self.audio_store)
             task.setAutoDelete(False)  # Python keeps the task until ``finished``
             task.signals.imported.connect(self._on_media_imported)
             task.signals.failed.connect(self._on_import_failed)
