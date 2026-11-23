@@ -15,15 +15,63 @@ import logging
 from pathlib import Path
 
 import numpy as np
-from PySide6.QtCore import QObject, Signal
+from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal, Slot
 from PySide6.QtGui import QUndoStack
 
 from edison.media.audio import AudioStore
+from edison.media.probe import UnsupportedMediaError, is_supported, probe_media, video_thumbnail
 from edison.model import editing
 from edison.model.editing import EditError
 from edison.model.project import Project
 
 logger = logging.getLogger(__name__)
+
+
+class _ImportSignals(QObject):
+    """Signals of an import task (a QRunnable is not a QObject and cannot have signals)."""
+
+    imported = Signal(int, object, object)  # batch number, Media, thumbnail (numpy array or None)
+    failed = Signal(int, str, str)  # batch number, file name, reason
+    finished = Signal(int, object)  # batch number, the task itself
+
+
+class _ImportTask(QRunnable):
+    """Analyse one file in a worker thread: ``probe_media`` then ``video_thumbnail``.
+
+    The results go back to the main thread through the signals (queued connections).
+    """
+
+    def __init__(self, batch: int, path: str):
+        super().__init__()
+        self.batch = batch
+        self.path = path
+        self.signals = _ImportSignals()
+
+    def run(self) -> None:
+        name = Path(self.path).name
+        try:
+            media = probe_media(self.path)
+            thumbnail = video_thumbnail(media)
+            # TODO(S4): self.audio_store.load(media) when the media has sound.
+        except UnsupportedMediaError as error:
+            self.signals.failed.emit(self.batch, name, str(error))
+        except Exception:  # noqa: BLE001 - a worker thread must never crash the application
+            logger.exception("Import failed: %s", self.path)
+            self.signals.failed.emit(self.batch, name, "Erreur inattendue pendant l'analyse.")
+        else:
+            self.signals.imported.emit(self.batch, media, thumbnail)
+        finally:
+            self.signals.finished.emit(self.batch, self)
+
+
+class _ImportBatch:
+    """Files given to one call of ``import_files``: errors are shown together at the end."""
+
+    def __init__(self, project: Project, remaining: int, errors: list):
+        self.project = project
+        self.remaining = remaining
+        self.errors = errors
+        self.imported = 0
 
 
 class ProjectController(QObject):
@@ -49,6 +97,10 @@ class ProjectController(QObject):
         self.previews: dict[str, np.ndarray] = {}  # media id -> thumbnail shown in the "Import" tab
         self.selected_clips: set[str] = set()
         self.selected_junction: tuple[str, str, str] | None = None  # (track id, left clip id, right clip id)
+        self._thread_pool = QThreadPool.globalInstance()
+        self._import_batches: dict[int, _ImportBatch] = {}
+        self._import_tasks: set[_ImportTask] = set()  # keeps the tasks (and their signals) alive
+        self._next_batch = 0
 
     # ================================================================ helpers
     def todo(self, feature: str, sprint: str) -> None:
@@ -118,17 +170,75 @@ class ProjectController(QObject):
     def import_files(self, paths: list[str]) -> None:
         """Import files into the library ("+" tile, or files dropped from the explorer).
 
-        TODO(S2) "Import fonctionnel":
-            * refused extension (``probe.is_supported``) -> add ``(name, reason)`` to a list and
-              emit ``import_errors`` at the end: the "Import" tab shows them with the accepted formats;
-            * otherwise, in a worker thread (``QThreadPool`` + ``QRunnable``, the interface must not
-              freeze): ``probe_media(path)``, the thumbnail (``video_thumbnail``) and, later, the
-              audio decoding (``audio_store.load``, S4);
-            * back in the main thread (connect the signals of the task to methods of this class):
-              ``self.project.media.append(media)``, ``self.previews[media.id] = thumbnail``,
-              then emit ``media_changed``.
+        Refused extensions are reported at once; the other files are analysed in worker
+        threads (``QThreadPool``), so the interface does not freeze. Each result comes back in
+        the main thread (:meth:`_on_media_imported`); the errors of the whole selection are
+        shown together with ``import_errors`` when the last file is done.
         """
-        self.todo("Import des médias", "S2")
+        if self.project is None or not paths:
+            return
+        errors = []
+        accepted = []
+        for path in paths:
+            if is_supported(path):
+                accepted.append(str(path))
+            else:
+                errors.append((Path(path).name, "Format non pris en charge."))
+        if not accepted:
+            self.import_errors.emit(errors)
+            return
+
+        batch = self._next_batch
+        self._next_batch += 1
+        self._import_batches[batch] = _ImportBatch(self.project, len(accepted), errors)
+        self.message.emit(f"Import de {len(accepted)} fichier(s)...")
+        for path in accepted:
+            task = _ImportTask(batch, path)
+            task.setAutoDelete(False)  # Python keeps the task until ``finished``
+            task.signals.imported.connect(self._on_media_imported)
+            task.signals.failed.connect(self._on_import_failed)
+            task.signals.finished.connect(self._on_import_task_finished)
+            self._import_tasks.add(task)
+            self._thread_pool.start(task)
+
+    @property
+    def is_importing(self) -> bool:
+        """True while files are being analysed."""
+        return bool(self._import_batches)
+
+    @Slot(int, object, object)
+    def _on_media_imported(self, batch: int, media, thumbnail) -> None:
+        current = self._import_batches.get(batch)
+        if current is None or current.project is not self.project:
+            return  # the project was closed during the import
+        self.project.media.append(media)
+        if thumbnail is not None:
+            self.previews[media.id] = thumbnail
+        current.imported += 1
+        self.media_changed.emit()
+
+    @Slot(int, str, str)
+    def _on_import_failed(self, batch: int, name: str, reason: str) -> None:
+        current = self._import_batches.get(batch)
+        if current is not None:
+            current.errors.append((name, reason))
+
+    @Slot(int, object)
+    def _on_import_task_finished(self, batch: int, task) -> None:
+        self._import_tasks.discard(task)
+        current = self._import_batches.get(batch)
+        if current is None:
+            return
+        current.remaining -= 1
+        if current.remaining > 0:
+            return
+        del self._import_batches[batch]
+        if current.project is not self.project:
+            return
+        if current.imported:
+            self.message.emit(f"{current.imported} média(s) importé(s).")
+        if current.errors:
+            self.import_errors.emit(current.errors)
 
     def remove_media(self, media_id: str) -> None:
         """Remove a media from the library (refused if a clip of the timeline uses it)."""
